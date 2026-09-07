@@ -4,6 +4,85 @@ import pandas as pd
 from ffdraft import board, sources
 
 
+def _sample_espn_payload(*pick_rows, teams=10):
+    return {
+        "teams": [{"id": i} for i in range(1, teams + 1)],
+        "draftDetail": {
+            "drafted": True,
+            "inProgress": False,
+            "picks": list(pick_rows),
+        },
+    }
+
+
+class TestEspnDraftParsing:
+    def test_skips_unfilled_slots(self):
+        payload = _sample_espn_payload(
+            {"playerId": -1, "overallPickNumber": 1, "roundId": 1, "roundPickNumber": 1,
+             "teamId": 1},
+            {"playerId": 4430807, "overallPickNumber": 2, "roundId": 1, "roundPickNumber": 2,
+             "teamId": 2},
+        )
+        picks = board._parse_espn_picks(payload, {}, {})
+        assert len(picks) == 1
+        assert picks[0]["overall"] == 2
+
+    def test_skips_player_id_zero(self):
+        payload = _sample_espn_payload(
+            {"playerId": 0, "overallPickNumber": 1, "roundId": 1, "roundPickNumber": 1,
+             "teamId": 1},
+            {"playerId": 123, "overallPickNumber": 2, "roundId": 1, "roundPickNumber": 2,
+             "teamId": 2},
+        )
+        picks = board._parse_espn_picks(payload, {"123": "Test Player"}, {})
+        assert [p["overall"] for p in picks] == [2]
+
+    def test_derives_overall_when_missing(self):
+        payload = _sample_espn_payload(
+            {"playerId": 100, "roundId": 1, "roundPickNumber": 1, "teamId": 1},
+            {"playerId": 200, "roundId": 1, "roundPickNumber": 2, "teamId": 2},
+        )
+        picks = board._parse_espn_picks(payload, {"100": "A", "200": "B"}, {})
+        assert [p["overall"] for p in picks] == [1, 2]
+
+    def test_resolves_names_from_roster_in_payload(self):
+        payload = _sample_espn_payload(
+            {"playerId": 999, "overallPickNumber": 1, "roundId": 1, "roundPickNumber": 3,
+             "teamId": 3},
+        )
+        payload["teams"] = [{
+            "id": 3,
+            "roster": {"entries": [{"playerPoolEntry": {"player": {"id": 999,
+                                                                   "fullName": "Roster Guy"}}}]},
+        }]
+        picks = board._parse_espn_picks(payload, {}, board._espn_player_name_map(payload))
+        assert picks[0]["name"] == "Roster Guy"
+        assert picks[0]["slot"] == 3
+
+    def test_diagnostics_for_live_draft_with_only_unfilled_slots(self):
+        payload = {
+            "draftDetail": {
+                "drafted": False,
+                "inProgress": True,
+                "picks": [{"playerId": -1, "overallPickNumber": i, "teamId": 1}
+                          for i in range(1, 4)],
+            },
+        }
+        diag = board.espn_draft_diagnostics(payload)
+        assert diag["raw_slots"] == 3
+        assert diag["filled_slots"] == 0
+        assert "live draft" in (diag["hint"] or "").lower()
+
+    def test_dst_negative_id_not_treated_as_unfilled(self):
+        payload = _sample_espn_payload(
+            {"playerId": -15012, "overallPickNumber": 1, "roundId": 1,
+             "roundPickNumber": 1, "teamId": 1},
+        )
+        picks = board._parse_espn_picks(payload, {}, {})
+        assert len(picks) == 1
+        assert picks[0]["name"] == "Kansas City Chiefs D/ST"
+
+
 class TestIdCrosswalk:
     def test_prefers_row_with_espn_id_over_earlier_null_row(self, monkeypatch):
         # weekly_rosters has one row per player per week; espn_id/sleeper_id are

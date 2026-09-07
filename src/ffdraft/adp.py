@@ -1101,7 +1101,7 @@ def champion_strategies(league_id: str, seasons: list[int]) -> dict:
         resolved = {p["overall"]: p["name"] for p in bd.sync_espn(league_id, season=season)}
         raw_picks = (data.get("draftDetail") or {}).get("picks") or []
         champ_raw = sorted([p for p in raw_picks if p.get("teamId") == champ["id"]
-                           and p.get("playerId", -1) != -1],
+                           and not bd._is_unfilled_espn_pick(p.get("playerId"))],
                           key=lambda p: p.get("overallPickNumber", 0))
         picks = []
         for p in champ_raw:

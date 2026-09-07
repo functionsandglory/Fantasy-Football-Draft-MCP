@@ -394,6 +394,181 @@ def sync_sleeper(draft_id: str) -> list[dict]:
     return sorted([o for o in out if o["name"]], key=lambda o: o["overall"] or 0)
 
 
+def _espn_cookies(swid: str | None = None, espn_s2: str | None = None) -> dict:
+    swid = swid or os.environ.get("ESPN_SWID")
+    espn_s2 = espn_s2 or os.environ.get("ESPN_S2")
+    if not (swid and espn_s2):
+        return {}
+    return {"SWID": swid if swid.startswith("{") else f"{{{swid}}}",
+            "espn_s2": espn_s2}
+
+
+def _fetch_espn_league(league_id: str, season: int,
+                       swid: str | None = None, espn_s2: str | None = None) -> dict:
+    """Fetch league JSON with draft, team, roster, and player views."""
+    cookies = _espn_cookies(swid, espn_s2)
+    views = ["mDraftDetail", "mTeam", "mSettings", "mRoster", "kona_player_info"]
+    headers = {"User-Agent": "ffdraft-mcp/1.0"}
+    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
+           f"/segments/0/leagues/{league_id}")
+    resp = requests.get(url, params={"view": views}, cookies=cookies, timeout=20, headers=headers)
+    if resp.status_code == 200:
+        return resp.json()
+    # Pre-2018 seasons live on leagueHistory instead of the seasons path.
+    if season >= 2018:
+        resp.raise_for_status()
+    hist_url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/leagueHistory/"
+                f"{league_id}")
+    resp = requests.get(hist_url, params={"view": views, "seasonId": season},
+                        cookies=cookies, timeout=20, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        if not data:
+            return {}
+        data = data[0]
+    return data
+
+
+def _is_unfilled_espn_pick(player_id) -> bool:
+    """True when ESPN marks a draft slot as not yet picked.
+
+    Unfilled slots use playerId -1 (or 0/None). Team defenses are also negative
+    (e.g. -16033) and must not be treated as empty.
+    """
+    if player_id is None:
+        return True
+    try:
+        pid = int(player_id)
+    except (TypeError, ValueError):
+        return True
+    return pid == -1 or pid == 0
+
+
+def _espn_player_name_map(data: dict) -> dict[str, str]:
+    """playerId -> fullName from rosters and kona_player_info in the same payload."""
+    out: dict[str, str] = {}
+    for team in data.get("teams") or []:
+        for entry in (team.get("roster") or {}).get("entries") or []:
+            player = (entry.get("playerPoolEntry") or {}).get("player") or {}
+            pid = player.get("id")
+            name = player.get("fullName")
+            if pid is not None and name:
+                out[str(pid)] = name
+    for item in data.get("players") or []:
+        player = item.get("player") if isinstance(item, dict) else None
+        player = player or item
+        if not isinstance(player, dict):
+            continue
+        pid = player.get("id")
+        name = player.get("fullName")
+        if pid is not None and name:
+            out[str(pid)] = name
+    return out
+
+
+def _espn_dst_name(player_id: int) -> str:
+    """Resolve team defense picks. ESPN uses negative ids with different offsets."""
+    for offset in (16000, 15000):
+        team_id = -player_id - offset
+        if team_id in _ESPN_PRO_TEAMS:
+            return f"{_ESPN_PRO_TEAMS[team_id]} D/ST"
+    return f"ESPN#{player_id} D/ST"
+
+
+def _espn_team_slots(raw_picks: list[dict]) -> dict[int, int]:
+    """Map ESPN teamId -> first-round draft slot (roundPickNumber)."""
+    slots: dict[int, int] = {}
+    for p in raw_picks:
+        if p.get("roundId") != 1:
+            continue
+        if _is_unfilled_espn_pick(p.get("playerId")):
+            continue
+        team_id = p.get("teamId")
+        slot = p.get("roundPickNumber")
+        if team_id is not None and slot is not None:
+            slots[int(team_id)] = int(slot)
+    return slots
+
+
+def _espn_overall_pick(p: dict, n_teams: int, fallback: int) -> int | None:
+    overall = p.get("overallPickNumber")
+    if overall:
+        return int(overall)
+    rnd = p.get("roundId")
+    pick_in_round = p.get("roundPickNumber")
+    if rnd is not None and pick_in_round is not None and n_teams:
+        return (int(rnd) - 1) * n_teams + int(pick_in_round)
+    return fallback
+
+
+def _parse_espn_picks(data: dict, espn_map: dict[str, str],
+                      roster_names: dict[str, str]) -> list[dict]:
+    """Turn draftDetail.picks into normalized pick dicts."""
+    raw = (data.get("draftDetail") or {}).get("picks") or []
+    n_teams = len(data.get("teams") or []) or 1
+    team_slots = _espn_team_slots(raw)
+    sorted_raw = sorted(raw, key=lambda p: (
+        p.get("roundId") or 0, p.get("roundPickNumber") or 0, p.get("overallPickNumber") or 0))
+    out = []
+    for i, p in enumerate(sorted_raw):
+        pid = p.get("playerId")
+        if _is_unfilled_espn_pick(pid):
+            continue
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            continue
+        # Team defenses aren't players -- no gsis_id, so they're never in the
+        # crosswalk. ESPN encodes them as -(16000 + proTeamId) instead.
+        if pid_int < 0:
+            name = _espn_dst_name(pid_int)
+        else:
+            pid_key = str(pid_int)
+            name = (espn_map.get(pid_key) or roster_names.get(pid_key) or f"ESPN#{pid_int}")
+        overall = _espn_overall_pick(p, n_teams, i + 1)
+        if not overall:
+            continue
+        team_id = p.get("teamId")
+        slot = team_slots.get(int(team_id)) if team_id is not None else None
+        out.append({
+            "overall": overall,
+            "slot": slot,
+            "name": name,
+            "player_id": None,
+        })
+    return sorted(out, key=lambda o: o["overall"])
+
+
+def espn_draft_diagnostics(data: dict) -> dict:
+    """Explain why sync_espn might return zero picks despite a draftDetail payload."""
+    detail = data.get("draftDetail") or {}
+    raw = detail.get("picks") or []
+    filled = sum(1 for p in raw if not _is_unfilled_espn_pick(p.get("playerId")))
+    drafted = detail.get("drafted")
+    in_progress = detail.get("inProgress")
+    hint = None
+    if raw and not filled:
+        if in_progress:
+            hint = ("ESPN's mDraftDetail often does not update playerId during a live "
+                    "draft -- picks may only appear after the draft finishes. Use "
+                    "platform='paste' or record picks manually until then.")
+        elif not drafted:
+            hint = ("The draft is scheduled but ESPN reports drafted=false -- every slot "
+                    "still has playerId -1/0. Pass the correct season= if this league's "
+                    "draft was in a prior year.")
+        else:
+            hint = ("draftDetail has slots but no filled playerIds -- check season= and "
+                    "that ESPN_SWID/ESPN_S2 are set for private leagues.")
+    return {
+        "drafted": drafted,
+        "in_progress": in_progress,
+        "raw_slots": len(raw),
+        "filled_slots": filled,
+        "hint": hint,
+    }
+
+
 def sync_espn(league_id: str, season: int = CURRENT_SEASON,
               swid: str | None = None, espn_s2: str | None = None) -> list[dict]:
     """Pull picks from an ESPN league's draft detail endpoint.
@@ -402,45 +577,10 @@ def sync_espn(league_id: str, season: int = CURRENT_SEASON,
     espn_s2 cookies from a logged-in browser session, passed here or set as the
     ESPN_SWID / ESPN_S2 environment variables.
     """
-    swid = swid or os.environ.get("ESPN_SWID")
-    espn_s2 = espn_s2 or os.environ.get("ESPN_S2")
-    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
-           f"/segments/0/leagues/{league_id}")
-    cookies = {}
-    if swid and espn_s2:
-        cookies = {"SWID": swid if swid.startswith("{") else f"{{{swid}}}",
-                   "espn_s2": espn_s2}
-    resp = requests.get(url, params={"view": ["mDraftDetail", "mTeam", "kona_player_info"]},
-                        cookies=cookies, timeout=20,
-                        headers={"User-Agent": "ffdraft-mcp/1.0"})
-    resp.raise_for_status()
-    data = resp.json()
-    picks = (data.get("draftDetail") or {}).get("picks") or []
-
+    data = _fetch_espn_league(league_id, season, swid=swid, espn_s2=espn_s2)
     xwalk = _id_crosswalk()
     espn_map = xwalk.dropna(subset=["espn_id"]).set_index("espn_id")["full_name"].to_dict()
-    out = []
-    for p in picks:
-        # ESPN returns every slot in the draft order, filled or not -- a slot
-        # nobody has picked yet comes back with playerId -1, not omitted. Treating
-        # those as real (if unmatched) picks made the server think the draft was
-        # far ahead of where it actually was.
-        pid = p.get("playerId")
-        if pid is None or pid == -1:
-            continue
-        # Team defenses aren't players -- no gsis_id, so they're never in the
-        # crosswalk. ESPN encodes them as -(16000 + proTeamId) instead.
-        if pid < 0:
-            name = f"{_ESPN_PRO_TEAMS.get(-pid - 16000, f'ESPN#{pid}')} D/ST"
-        else:
-            name = espn_map.get(str(pid), f"ESPN#{pid}")
-        out.append({
-            "overall": p.get("overallPickNumber"),
-            "slot": None,
-            "name": name,
-            "player_id": None,
-        })
-    return sorted([o for o in out if o["overall"]], key=lambda o: o["overall"])
+    return _parse_espn_picks(data, espn_map, _espn_player_name_map(data))
 
 
 # ESPN's lineupSlotCounts slot ids that count as a flex, and which positions each
@@ -460,17 +600,7 @@ def espn_league_context(league_id: str, season: int = CURRENT_SEASON,
     """
     swid = swid or os.environ.get("ESPN_SWID")
     espn_s2 = espn_s2 or os.environ.get("ESPN_S2")
-    cookies = {}
-    if swid and espn_s2:
-        cookies = {"SWID": swid if swid.startswith("{") else f"{{{swid}}}",
-                   "espn_s2": espn_s2}
-    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
-           f"/segments/0/leagues/{league_id}")
-    resp = requests.get(url, params={"view": ["mTeam", "mSettings", "mDraftDetail"]},
-                        cookies=cookies, timeout=20,
-                        headers={"User-Agent": "ffdraft-mcp/1.0"})
-    resp.raise_for_status()
-    data = resp.json()
+    data = _fetch_espn_league(league_id, season, swid=swid, espn_s2=espn_s2)
     settings = data.get("settings") or {}
     teams = data.get("teams") or []
 
@@ -496,8 +626,14 @@ def espn_league_context(league_id: str, season: int = CURRENT_SEASON,
     draft_slot = None
     if my_team is not None:
         picks = (data.get("draftDetail") or {}).get("picks") or []
-        mine = sorted([p for p in picks if p.get("teamId") == my_team["id"]],
+        mine = sorted([p for p in picks
+                       if p.get("teamId") == my_team["id"]
+                       and not _is_unfilled_espn_pick(p.get("playerId"))],
                       key=lambda p: p.get("overallPickNumber", 0))
+        if not mine:
+            # Fall back to round-1 slot order even before any picks are recorded.
+            mine = sorted([p for p in picks if p.get("teamId") == my_team["id"]],
+                          key=lambda p: p.get("overallPickNumber", 0))
         if mine:
             draft_slot = mine[0].get("roundPickNumber")
 
