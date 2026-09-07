@@ -108,6 +108,16 @@ id, not the league id. Mock drafts have their own ids.
 Private leagues need `ESPN_SWID` and `ESPN_S2` set before the server starts. Cookies
 expire — log into ESPN and copy fresh ones. See [SECURITY.md](../SECURITY.md).
 
+**ESPN live draft shows `picks_synced: 0` but the API response has a big `picks` array**
+Normal for a live or not-yet-started draft. ESPN pre-allocates every slot in
+`draftDetail.picks` with `playerId: -1` before anyone picks; the array length is
+teams × rounds, not picks made so far. The standard `mDraftDetail` endpoint usually
+does not stream live picks — the draft room uses a separate protocol, and playerIds
+often only fill in after the draft ends (or lag badly mid-draft). Check
+`espn_draft.filled_slots` in the sync response: if it is 0 while you are mid-draft,
+use `platform="paste"` or `record_pick` between picks. Sleeper's public draft API
+is fully live if your league drafts there instead.
+
 **ESPN picks show as `ESPN#12345`**
 The player id didn't map. Usually a rookie missing from the crosswalk. Record manually.
 

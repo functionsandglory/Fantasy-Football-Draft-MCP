@@ -403,20 +403,57 @@ def _espn_cookies(swid: str | None = None, espn_s2: str | None = None) -> dict:
             "espn_s2": espn_s2}
 
 
+def _espn_request_headers() -> dict:
+    """Headers ESPN's own web client sends; some live-draft reads need them."""
+    return {
+        "User-Agent": "ffdraft-mcp/1.0",
+        "Accept": "application/json, text/plain, */*",
+        "X-Fantasy-Platform": "kona-PROD",
+        "X-Fantasy-Source": "kona",
+    }
+
+
+def _espn_filled_pick_count(data: dict) -> int:
+    raw = (data.get("draftDetail") or {}).get("picks") or []
+    return sum(1 for p in raw if not _is_unfilled_espn_pick(p.get("playerId")))
+
+
 def _fetch_espn_league(league_id: str, season: int,
                        swid: str | None = None, espn_s2: str | None = None) -> dict:
-    """Fetch league JSON with draft, team, roster, and player views."""
+    """Fetch league JSON with draft, team, roster, and player views.
+
+    Tries lm-api-reads first, then fantasy.espn.com. During a live draft the two
+    hosts can disagree on how many slots have a real playerId — keep whichever
+    reports more filled picks (with cookies when available).
+    """
     cookies = _espn_cookies(swid, espn_s2)
     views = ["mDraftDetail", "mTeam", "mSettings", "mRoster", "kona_player_info"]
-    headers = {"User-Agent": "ffdraft-mcp/1.0"}
-    url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
-           f"/segments/0/leagues/{league_id}")
-    resp = requests.get(url, params={"view": views}, cookies=cookies, timeout=20, headers=headers)
-    if resp.status_code == 200:
-        return resp.json()
+    headers = _espn_request_headers()
+    paths = [
+        (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
+         f"/segments/0/leagues/{league_id}", {}),
+        (f"https://fantasy.espn.com/apis/v3/games/ffl/seasons/{season}"
+         f"/segments/0/leagues/{league_id}", {}),
+    ]
+    best: dict = {}
+    best_filled = -1
+    for base, extra in paths:
+        resp = requests.get(base, params={"view": views, **extra},
+                            cookies=cookies, timeout=20, headers=headers)
+        if resp.status_code != 200:
+            continue
+        data = resp.json()
+        filled = _espn_filled_pick_count(data)
+        if filled > best_filled:
+            best, best_filled = data, filled
+    if best:
+        return best
     # Pre-2018 seasons live on leagueHistory instead of the seasons path.
     if season >= 2018:
+        resp = requests.get(paths[0][0], params={"view": views},
+                            cookies=cookies, timeout=20, headers=headers)
         resp.raise_for_status()
+        return resp.json()
     hist_url = (f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/ffl/leagueHistory/"
                 f"{league_id}")
     resp = requests.get(hist_url, params={"view": views, "seasonId": season},
@@ -550,21 +587,37 @@ def espn_draft_diagnostics(data: dict) -> dict:
     hint = None
     if raw and not filled:
         if in_progress:
-            hint = ("ESPN's mDraftDetail often does not update playerId during a live "
-                    "draft -- picks may only appear after the draft finishes. Use "
-                    "platform='paste' or record picks manually until then.")
+            hint = (
+                "ESPN returned the full draft order (raw_slots) but every slot still has "
+                "playerId -1 — the standard mDraftDetail endpoint usually does not stream "
+                "live picks. The draft room uses a separate protocol; mDraftDetail typically "
+                "fills in only after the draft ends (or lags badly mid-draft). For a live "
+                "ESPN draft, use platform='paste' or record_pick between picks. Private "
+                "leagues also need ESPN_SWID and ESPN_S2 set before the server starts."
+            )
         elif not drafted:
-            hint = ("The draft is scheduled but ESPN reports drafted=false -- every slot "
-                    "still has playerId -1/0. Pass the correct season= if this league's "
-                    "draft was in a prior year.")
+            hint = (
+                "The draft is scheduled but ESPN reports drafted=false — every slot still "
+                "has playerId -1/0. That is normal before the draft starts (ESPN pre-allocates "
+                "the pick order). Pass the correct season= if you meant a prior year."
+            )
         else:
-            hint = ("draftDetail has slots but no filled playerIds -- check season= and "
-                    "that ESPN_SWID/ESPN_S2 are set for private leagues.")
+            hint = (
+                "draftDetail has slots but no filled playerIds — check season= and that "
+                "ESPN_SWID/ESPN_S2 are set for private leagues."
+            )
+    elif in_progress and filled:
+        hint = (
+            f"Live draft: {filled} of {len(raw)} slots have a playerId so far. Re-sync "
+            "between picks; if the count stops updating, ESPN has stopped pushing picks to "
+            "mDraftDetail and you will need platform='paste'."
+        )
     return {
         "drafted": drafted,
         "in_progress": in_progress,
         "raw_slots": len(raw),
         "filled_slots": filled,
+        "on_the_clock": filled + 1 if raw else None,
         "hint": hint,
     }
 

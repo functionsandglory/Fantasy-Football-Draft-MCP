@@ -71,7 +71,7 @@ class TestEspnDraftParsing:
         diag = board.espn_draft_diagnostics(payload)
         assert diag["raw_slots"] == 3
         assert diag["filled_slots"] == 0
-        assert "live draft" in (diag["hint"] or "").lower()
+        assert "live draft" in (diag["hint"] or "").lower() or "mDraftDetail" in (diag["hint"] or "")
 
     def test_dst_negative_id_not_treated_as_unfilled(self):
         payload = _sample_espn_payload(

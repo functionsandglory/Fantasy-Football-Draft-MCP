@@ -348,10 +348,11 @@ def sync_draft(platform: str, league_id: str | None = None, draft_id: str | None
     elif platform == "espn":
         if not league_id:
             return json.dumps({"error": "league_id required for ESPN"})
-        picks = bd.sync_espn(league_id, season)
-        if not picks:
-            raw = bd._fetch_espn_league(league_id, season)
-            espn_meta = bd.espn_draft_diagnostics(raw)
+        raw = bd._fetch_espn_league(league_id, season)
+        xwalk = bd._id_crosswalk()
+        espn_map = xwalk.dropna(subset=["espn_id"]).set_index("espn_id")["full_name"].to_dict()
+        picks = bd._parse_espn_picks(raw, espn_map, bd._espn_player_name_map(raw))
+        espn_meta = bd.espn_draft_diagnostics(raw)
     elif platform == "paste":
         if not pasted_board:
             return json.dumps({"error": "pasted_board text required"})
