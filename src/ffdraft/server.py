@@ -339,6 +339,7 @@ def sync_draft(platform: str, league_id: str | None = None, draft_id: str | None
     state = _state()
     b = _build_board()
     platform = platform.lower()
+    espn_meta = None
 
     if platform == "sleeper":
         if not draft_id:
@@ -347,7 +348,11 @@ def sync_draft(platform: str, league_id: str | None = None, draft_id: str | None
     elif platform == "espn":
         if not league_id:
             return json.dumps({"error": "league_id required for ESPN"})
-        picks = bd.sync_espn(league_id, season)
+        raw = bd._fetch_espn_league(league_id, season)
+        xwalk = bd._id_crosswalk()
+        espn_map = xwalk.dropna(subset=["espn_id"]).set_index("espn_id")["full_name"].to_dict()
+        picks = bd._parse_espn_picks(raw, espn_map, bd._espn_player_name_map(raw))
+        espn_meta = bd.espn_draft_diagnostics(raw)
     elif platform == "paste":
         if not pasted_board:
             return json.dumps({"error": "pasted_board text required"})
@@ -365,11 +370,14 @@ def sync_draft(platform: str, league_id: str | None = None, draft_id: str | None
             unmatched.append(p["name"])
         state.record(row["name"] if row is not None else p["name"],
                      p.get("overall"), p.get("slot"))
-    return json.dumps({
+    result = {
         "platform": platform, "picks_synced": len(picks),
         "unmatched_names": unmatched[:20],
         **state.summary(),
-    }, indent=2)
+    }
+    if espn_meta is not None:
+        result["espn_draft"] = espn_meta
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
