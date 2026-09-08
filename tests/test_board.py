@@ -4,6 +4,62 @@ import pandas as pd
 from ffdraft import board, sources
 
 
+class TestParsePastedBoard:
+    def test_skips_standalone_label_lines(self):
+        text = """R1, P1 - For the Sorg
+Ja'Marr Chase CIN WR
+R1, P2 - Other Team
+Christian McCaffrey SF RB"""
+        entries = board.parse_pasted_board(text)
+        assert len(entries) == 2
+        assert entries[0] == {"overall": 1, "name": "Ja'Marr Chase", "position": "WR"}
+        assert entries[1] == {"overall": 2, "name": "Christian McCaffrey", "position": "RB"}
+
+    def test_strips_trailing_team_and_position(self):
+        text = """Puka Nacua LAR WR
+Josh Allen BUF QB
+James Cook III BUF RB
+Kyle Pitts Sr. ATL TE"""
+        entries = board.parse_pasted_board(text)
+        names = [e["name"] for e in entries]
+        assert names == ["Puka Nacua", "Josh Allen", "James Cook III", "Kyle Pitts Sr."]
+
+    def test_preserves_pick_position_when_names_fail_to_match(self):
+        """Unmatched names must keep their line slot so downstream picks don't shift."""
+        text = """Player One AAA WR
+Player Two BBB WR
+Player Three CCC WR"""
+        entries = board.parse_pasted_board(text)
+        assert [e["overall"] for e in entries] == [1, 2, 3]
+
+    def test_inline_round_pick_with_player(self):
+        text = "Round 3, Pick 7 - Ja'Marr Chase CIN WR"
+        entries = board.parse_pasted_board(text)
+        assert len(entries) == 1
+        assert entries[0]["name"] == "Ja'Marr Chase"
+
+    def test_comma_separated_without_newlines(self):
+        text = "Ja'Marr Chase CIN WR, Christian McCaffrey SF RB"
+        entries = board.parse_pasted_board(text)
+        assert len(entries) == 2
+
+    def test_round_comma_pick_not_split_on_comma(self):
+        text = "Round 1, Pick 7 - Ja'Marr Chase CIN WR"
+        entries = board.parse_pasted_board(text)
+        assert len(entries) == 1
+        assert entries[0]["overall"] == 1
+
+    def test_numbered_list(self):
+        text = """45. Bucky Irving TB RB
+46. Cam Skattebo NYG RB"""
+        entries = board.parse_pasted_board(text)
+        assert len(entries) == 2
+        assert entries[0]["name"] == "Bucky Irving"
+        assert entries[1]["name"] == "Cam Skattebo"
+        assert entries[0]["overall"] == 1
+        assert entries[1]["overall"] == 2
+
+
 class TestIdCrosswalk:
     def test_prefers_row_with_espn_id_over_earlier_null_row(self, monkeypatch):
         # weekly_rosters has one row per player per week; espn_id/sleeper_id are

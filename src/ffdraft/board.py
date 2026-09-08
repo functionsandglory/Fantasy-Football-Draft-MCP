@@ -512,21 +512,100 @@ def espn_league_context(league_id: str, season: int = CURRENT_SEASON,
     }
 
 
-def parse_pasted_board(text: str) -> list[str]:
+_POS = r"(?:QB|RB|WR|TE|K|D/?ST|DEF)"
+_TEAM = r"[A-Z]{2,4}"
+_NOT_TEAM = frozenset({"II", "III", "IV", "JR", "SR", "V"})
+
+# Standalone "R1, P1 - Team Name" lines from draft-room UIs — metadata, not a pick.
+_LABEL_LINE = re.compile(
+    rf"^\s*(?:R?\d+[.,]\s*P?\d+|round\s*\d+[,\s]*pick\s*\d+)\s*[-–—:]\s*(.+)$",
+    re.I,
+)
+_ROUND_PREFIX = re.compile(
+    r"^\s*(?:"
+    r"(?:R?\d+[.,)\s]*P?\d+|\d+\.\d+)"  # R1, P1 / 1.1 / 45.
+    r"|round\s*\d+[,\s]*pick\s*\d+"
+    r")\s*[-–—:]?\s*",
+    re.I,
+)
+_NUMBERED_PICK = re.compile(r"^\s*(\d+)\.\s+")
+
+
+def _split_board_lines(text: str) -> list[str]:
+    """Split pasted text into logical lines without breaking 'Round 1, Pick 7'."""
+    if "\n" in text:
+        return text.splitlines()
+    protected = re.sub(
+        r"(round\s*\d+),\s*(pick\s*\d+)",
+        lambda m: f"{m.group(1)}\x00{m.group(2)}",
+        text,
+        flags=re.I,
+    )
+    return [p.replace("\x00", ",").strip() for p in re.split(r"[,;]+", protected) if p.strip()]
+
+
+def _has_position_tag(s: str) -> bool:
+    return bool(re.search(rf"\b{_POS}\b", s, re.I))
+
+
+def _is_label_line(s: str) -> bool:
+    """Round/pick header with a fantasy-team name and no player position."""
+    m = _LABEL_LINE.match(s.strip())
+    if not m:
+        return False
+    return not _has_position_tag(m.group(1))
+
+
+def _extract_position(s: str) -> str | None:
+    m = re.search(rf"\b({_POS})\b", s, re.I)
+    return m.group(1).upper().replace("DEF", "DST") if m else None
+
+
+def _strip_team_and_position(s: str) -> str:
+    """Remove trailing TEAM/POS tags common in pasted draft boards."""
+    s = re.sub(rf"\s*[/\-–—]\s*{_TEAM}\s+{_POS}\s*$", "", s, flags=re.I)
+    s = re.sub(rf"\s+{_TEAM}\s+{_POS}\s*$", "", s, flags=re.I)
+    s = re.sub(rf"\s*[-–—(]\s*{_TEAM}\)?\s+{_POS}\b.*$", "", s, flags=re.I)
+    s = re.sub(rf"\s*[-–—(]\s*{_POS}\b.*$", "", s, flags=re.I)
+    m = re.search(rf"\s+({_TEAM})\s*$", s)
+    if m and m.group(1) not in _NOT_TEAM:
+        s = s[:m.start()]
+    return s.strip()
+
+
+def _looks_like_player_name(s: str) -> bool:
+    return len(s) > 2 and bool(re.search(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}", s))
+
+
+def _parse_pick_line(s: str) -> dict | None:
+    """Extract player name (and optional position) from one pasted line."""
+    s = s.strip()
+    if not s or _is_label_line(s):
+        return None
+    s = _NUMBERED_PICK.sub("", s)
+    s = _ROUND_PREFIX.sub("", s)
+    position = _extract_position(s)
+    name = _strip_team_and_position(s)
+    if not _looks_like_player_name(name):
+        return None
+    return {"name": name, "position": position}
+
+
+def parse_pasted_board(text: str) -> list[dict]:
     """Best-effort parse of a pasted list of drafted players.
 
-    Handles the shapes people actually paste: numbered lists, 'Round 3, Pick 7 - Name',
-    comma-separated runs, and raw one-per-line names.
+    Returns one dict per genuine pick line, each with ``overall`` (1-based line
+    position among player lines only), ``name``, and optional ``position``.
+    Label-only lines like ``R1, P1 - For the Sorg`` are skipped so they do not
+    inflate the pick count or shift downstream overall_pick numbers.
+
+    Handles numbered lists, inline and standalone ``Round 3, Pick 7 - Name``,
+    comma-separated runs, and ``Name TEAM POS`` trailing tags.
     """
-    names = []
-    for chunk in re.split(r"[\n,;]+", text):
-        s = chunk.strip()
-        if not s:
+    entries: list[dict] = []
+    for line in _split_board_lines(text):
+        parsed = _parse_pick_line(line)
+        if parsed is None:
             continue
-        s = re.sub(r"^\s*(?:R?\d+[.):]|\d+\.\d+|round\s*\d+[,\s]*pick\s*\d+)\s*[-–—:]?\s*", "",
-                   s, flags=re.I)
-        s = re.sub(r"\s*[-–—(]\s*(QB|RB|WR|TE|K|D/?ST|DEF)\b.*$", "", s, flags=re.I)
-        s = re.sub(r"\s+[A-Z]{2,3}$", "", s).strip()
-        if len(s) > 2 and re.search(r"[A-Za-z]{2,}\s+[A-Za-z]{2,}", s):
-            names.append(s)
-    return names
+        entries.append({"overall": len(entries) + 1, **parsed})
+    return entries

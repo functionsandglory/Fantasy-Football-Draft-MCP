@@ -351,15 +351,16 @@ def sync_draft(platform: str, league_id: str | None = None, draft_id: str | None
     elif platform == "paste":
         if not pasted_board:
             return json.dumps({"error": "pasted_board text required"})
-        names = bd.parse_pasted_board(pasted_board)
-        picks = [{"overall": i + 1, "slot": None, "name": n} for i, n in enumerate(names)]
+        entries = bd.parse_pasted_board(pasted_board)
+        picks = [{"overall": e["overall"], "slot": None, "name": e["name"],
+                  "position": e.get("position")} for e in entries]
     else:
         return json.dumps({"error": f"unknown platform '{platform}'"})
 
     state.reset()
     unmatched = []
     for p in picks:
-        row = bd.match_player(p["name"], b)
+        row = bd.match_player(p["name"], b, position=p.get("position"))
         if row is None:
             unmatched.append(p["name"])
         state.record(row["name"] if row is not None else p["name"],
